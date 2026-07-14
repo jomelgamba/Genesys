@@ -20,7 +20,7 @@ def test_detect_header_skips_title_row(tmp_path):
     file_path = tmp_path / "sample.csv"
     file_path.write_text(content, encoding="utf-8")
 
-    header_index, delimiter = module._detect_header_and_delimiter(str(file_path))
+    header_index, delimiter = module._detect_header_and_delimiter(str(file_path), "utf-8-sig")
     assert (header_index, delimiter) == (2, ",")
 
 
@@ -29,8 +29,58 @@ def test_detect_header_falls_back_to_line_one_when_no_marker_found(tmp_path):
     file_path = tmp_path / "no_marker.csv"
     file_path.write_text(content, encoding="utf-8")
 
-    header_index, delimiter = module._detect_header_and_delimiter(str(file_path))
+    header_index, delimiter = module._detect_header_and_delimiter(str(file_path), "utf-8-sig")
     assert (header_index, delimiter) == (0, ",")
+
+
+def test_detect_header_matches_marker_regardless_of_space_or_underscore(tmp_path):
+    content = (
+        "Convey Health Solutions\n"
+        "Approved Enrollment\n"
+        "Processed Date,Member ID,First Name\n"
+        "2026-07-09,E6699487991,Kirankumar\n"
+    )
+    file_path = tmp_path / "enrollment.csv"
+    file_path.write_text(content, encoding="utf-8")
+
+    header_index, delimiter = module._detect_header_and_delimiter(str(file_path), "utf-8-sig")
+    assert (header_index, delimiter) == (2, ",")
+
+
+def test_detect_encoding_falls_back_to_cp1252_for_non_utf8_files(tmp_path):
+    file_path = tmp_path / "windows_export.csv"
+    # Raw byte 0x96 (CP-1252 en dash) is not a valid UTF-8 continuation byte.
+    file_path.write_bytes(b"Member_ID,Notes\n123,before\x96after\n")
+
+    assert module._detect_encoding(str(file_path)) == "cp1252"
+
+
+def test_load_csv_file_reads_cp1252_encoded_report(tmp_path):
+    file_path = tmp_path / "windows_export.csv"
+    file_path.write_bytes(b"Member_ID,Notes\n123,before\x96after\n")
+
+    records = module.load_csv_file(str(file_path))
+
+    assert len(records) == 1
+    assert records[0]["all_fields"]["Notes"].startswith("before")
+    assert records[0]["all_fields"]["Notes"].endswith("after")
+
+
+def test_load_csv_file_raises_when_header_detection_collapses_to_one_column(tmp_path):
+    # Real header uses an identifier column no configured marker matches, so
+    # detection falls back to line 1 -- a near-empty single-cell title row.
+    content = (
+        "Convey Health Solutions\n"
+        "SLA Returned Mail Detail\n"
+        "\n"
+        "Account_Number,MBI,Status\n"
+        "123,ABC123,Closed\n"
+    )
+    file_path = tmp_path / "sla_report.csv"
+    file_path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Header detection likely failed"):
+        module.load_csv_file(str(file_path))
 
 
 # =============================================================================

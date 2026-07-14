@@ -512,35 +512,59 @@ def normalize_scalar(value: Any) -> str:
     return str(value).strip()
 
 
-def _detect_header_and_delimiter(file_path: str) -> tuple[int, str]:
+def _normalize_header_text(text: str) -> str:
+    """Collapses whitespace to '_' so 'Member ID' and 'Member_ID' compare equal."""
+    return "_".join(text.split()).casefold()
+
+
+def _detect_encoding(file_path: str) -> str:
+    """
+    Most exports are UTF-8 (with BOM). Some Windows-originated exports use
+    CP-1252 (smart quotes, en/em dashes) and fail to decode as UTF-8.
+    """
+    with open(file_path, "rb") as handle:
+        raw_bytes = handle.read()
+    try:
+        raw_bytes.decode("utf-8-sig")
+        return "utf-8-sig"
+    except UnicodeDecodeError:
+        logging.warning(
+            "%s is not valid UTF-8; falling back to cp1252 encoding.",
+            os.path.basename(file_path),
+        )
+        return "cp1252"
+
+
+def _detect_header_and_delimiter(file_path: str, encoding: str) -> tuple[int, str]:
     """
     Returns (zero-based header line index, delimiter).
 
     Report exports can have title rows that *mention* a marker (e.g.
     'textbox7,Member_ID_1') above the real header. To avoid matching those,
     a candidate header line must:
-      - contain a marker as a full cell (exact or prefix match), AND
+      - contain a marker as a full cell (exact or prefix match, matched
+        after normalizing spaces/underscores), AND
       - have at least MIN_HEADER_COLUMNS columns.
     The line with the most columns among candidates wins, so the real
     multi-column header beats a short title row.
     """
-    markers_cf = [m.casefold() for m in HEADER_MARKERS]
+    markers_norm = [_normalize_header_text(m) for m in HEADER_MARKERS]
     MIN_HEADER_COLUMNS = _env_int("MIN_HEADER_COLUMNS", "3")
     MAX_SCAN_LINES = _env_int("MAX_HEADER_SCAN_LINES", "30")
 
     def cell_matches_marker(cell: str) -> bool:
-        cell_cf = cell.strip().strip('"').casefold()
-        if not cell_cf:
+        cell_norm = _normalize_header_text(cell.strip().strip('"'))
+        if not cell_norm:
             return False
-        for marker in markers_cf:
-            if cell_cf == marker or cell_cf.startswith(marker):
+        for marker in markers_norm:
+            if cell_norm == marker or cell_norm.startswith(marker):
                 return True
         return False
 
     best: Optional[tuple[int, str, int]] = None  # (line_index, delimiter, col_count)
 
     try:
-        with open(file_path, "r", encoding="utf-8-sig", newline="") as handle:
+        with open(file_path, "r", encoding=encoding, newline="") as handle:
             for index, raw_line in enumerate(handle):
                 if index >= MAX_SCAN_LINES:
                     break
@@ -587,13 +611,14 @@ def record_key(source_file: str, row_number: int, row_signature: str) -> str:
 def load_csv_file(file_path: str) -> list[dict[str, Any]]:
     logging.info("Reading CSV file: %s", file_path)
 
-    header_row_index, delimiter = _detect_header_and_delimiter(file_path)
+    encoding = _detect_encoding(file_path)
+    header_row_index, delimiter = _detect_header_and_delimiter(file_path, encoding)
 
     dataframe = pd.read_csv(
         file_path,
         dtype=str,
         keep_default_na=False,
-        encoding="utf-8-sig",
+        encoding=encoding,
         header=header_row_index,
         sep=delimiter,
         skip_blank_lines=False,
@@ -604,6 +629,17 @@ def load_csv_file(file_path: str) -> list[dict[str, Any]]:
     dataframe = dataframe.loc[:, [
         c for c in dataframe.columns if c and not str(c).startswith("Unnamed")
     ]]
+
+    # A real report header rarely collapses to 0-1 usable columns; when it
+    # does, header detection almost certainly landed on a title row instead
+    # of the real header (misdetection silently drops every other column's
+    # data rather than raising). Fail loud instead of loading garbage.
+    if len(dataframe.columns) <= 1:
+        raise RuntimeError(
+            f"Header detection likely failed for {os.path.basename(file_path)}: "
+            f"only {len(dataframe.columns)} usable column(s) found at line "
+            f"{header_row_index + 1}. Check HEADER_MARKERS / MIN_HEADER_COLUMNS."
+        )
 
     records: list[dict[str, Any]] = []
     source_file = os.path.basename(file_path)
