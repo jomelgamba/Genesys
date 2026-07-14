@@ -85,7 +85,14 @@ ASSIGNMENT_WAIT_SECONDS = _env_int("ASSIGNMENT_WAIT_SECONDS", "60")
 POLL_INTERVAL_SECONDS = _env_float("POLL_INTERVAL_SECONDS", "2")
 INTER_RECORD_DELAY_SECONDS = _env_float("INTER_RECORD_DELAY_SECONDS", "1")
 PROCESS_LIMIT = _env_int("PROCESS_LIMIT", "0")
+PROCESS_LIMIT_PER_FILE = _env_int("PROCESS_LIMIT_PER_FILE", "0")
 PRIORITY = _env_int("PRIORITY", "0")
+
+# When true, records are loaded and email payloads are built locally but no
+# Genesys API calls are made (no auth, no interaction creation). Useful for
+# validating CSV/header parsing against a new report format before running
+# for real. Combine with PROCESS_LIMIT_PER_FILE to sample a few rows per file.
+DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 REQUIRE_QUEUE_MEMBERSHIP = os.getenv(
     "REQUIRE_QUEUE_MEMBERSHIP", "true"
@@ -635,6 +642,19 @@ def find_csv_files(folder: str) -> list[str]:
     return sorted(glob.glob(os.path.join(folder, "*.csv")))
 
 
+def load_all_records(csv_files: list[str], limit_per_file: int = 0) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for file_path in csv_files:
+        try:
+            file_records = load_csv_file(file_path)
+            if limit_per_file > 0:
+                file_records = file_records[:limit_per_file]
+            records.extend(file_records)
+        except Exception as exc:
+            logging.exception("Failed to read file (skipping): %s error=%s", file_path, exc)
+    return records
+
+
 def move_processed_file(file_path: str) -> Optional[str]:
     """
     Moves a fully-processed source file into a date-partitioned processed
@@ -1076,6 +1096,41 @@ def append_result(
     })
 
 
+def write_dry_run_preview(records: list[dict[str, Any]]) -> str:
+    """
+    Builds email payloads locally (no Genesys API calls) so CSV/header
+    parsing can be validated for a new report format before running live.
+    """
+    preview_rows = []
+    for record in records:
+        payload = build_email_payload(record, queue_id="DRY_RUN", internal_user_id="DRY_RUN")
+        logging.info(
+            "[DRY_RUN] file=%s row=%s subject=%s field_count=%s",
+            record["source_file"], record["row_number"], payload["subject"],
+            len(record["all_fields"]),
+        )
+        preview_rows.append({
+            "source_file": record["source_file"],
+            "source_row": record["row_number"],
+            "record_key": record["record_key"],
+            "subject": payload["subject"],
+            "field_count": len(record["all_fields"]),
+        })
+    preview_path = Path(OUTPUT_DIR) / f"qa_email_dry_run_preview_{RUN_ID}.csv"
+    with preview_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["source_file", "source_row", "record_key", "subject", "field_count"],
+        )
+        writer.writeheader()
+        writer.writerows(preview_rows)
+    logging.info(
+        "DRY_RUN complete. records_previewed=%s preview_file=%s",
+        len(preview_rows), preview_path,
+    )
+    return str(preview_path)
+
+
 def write_results(results: list[dict[str, Any]]) -> str:
     output_path = Path(OUTPUT_DIR) / f"{RESULT_FILE_PREFIX}_{RUN_ID}.csv"
     with output_path.open("w", newline="", encoding="utf-8-sig") as handle:
@@ -1090,17 +1145,19 @@ def write_results(results: list[dict[str, Any]]) -> str:
 # =============================================================================
 
 def validate_config() -> None:
-    missing = [
-        key for key, value in {
-            "CLIENT_ID": CLIENT_ID,
-            "CLIENT_SECRET": CLIENT_SECRET,
-            "MIRAMAR_FOLDER": MIRAMAR_FOLDER,
-            "EMAIL_PROVIDER": EMAIL_PROVIDER,
-            "EMAIL_FROM_ADDRESS": EMAIL_FROM_ADDRESS,
-        }.items() if not value
-    ]
+    required = {
+        "MIRAMAR_FOLDER": MIRAMAR_FOLDER,
+        "EMAIL_PROVIDER": EMAIL_PROVIDER,
+        "EMAIL_FROM_ADDRESS": EMAIL_FROM_ADDRESS,
+    }
+    if not DRY_RUN:
+        required["CLIENT_ID"] = CLIENT_ID
+        required["CLIENT_SECRET"] = CLIENT_SECRET
+    missing = [key for key, value in required.items() if not value]
     if missing:
         raise RuntimeError(f"Missing required configuration values: {missing}")
+    if DRY_RUN:
+        return
     if not TARGET_QUEUE_ID and not TARGET_QUEUE_NAME:
         raise RuntimeError(
             "Must configure either TARGET_QUEUE_ID or TARGET_QUEUE_NAME."
@@ -1129,12 +1186,9 @@ def main() -> int:
     logging.info("Header markers: %s", HEADER_MARKERS)
     logging.info("=" * 72)
 
-    records: list[dict[str, Any]] = []
-    for file_path in csv_files:
-        try:
-            records.extend(load_csv_file(file_path))
-        except Exception as exc:
-            logging.exception("Failed to read file (skipping): %s error=%s", file_path, exc)
+    records = load_all_records(csv_files, PROCESS_LIMIT_PER_FILE)
+    if PROCESS_LIMIT_PER_FILE > 0:
+        logging.info("PROCESS_LIMIT_PER_FILE applied. records_after_sampling=%s", len(records))
 
     if not records:
         raise RuntimeError("No CSV records were found.")
@@ -1165,15 +1219,20 @@ def main() -> int:
             "Skipped %s previously successful records.", original_count - len(records)
         )
 
-    # If PROCESS_LIMIT is in effect we do NOT move any files, because a file
-    # may be only partially processed. Track this to disable moves below.
-    process_limited = PROCESS_LIMIT > 0
+    # If PROCESS_LIMIT or PROCESS_LIMIT_PER_FILE is in effect we do NOT move
+    # any files, because a file may be only partially processed. Track this
+    # to disable moves below.
+    process_limited = PROCESS_LIMIT > 0 or PROCESS_LIMIT_PER_FILE > 0
     if PROCESS_LIMIT > 0:
         records = records[:PROCESS_LIMIT]
         logging.info("PROCESS_LIMIT applied. records_to_process=%s", len(records))
 
     if not records:
         logging.info("Nothing to process after idempotency filtering.")
+        return 0
+
+    if DRY_RUN:
+        write_dry_run_preview(records)
         return 0
 
     authenticate()

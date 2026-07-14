@@ -1,4 +1,5 @@
 import csv
+from pathlib import Path
 
 import pytest
 
@@ -276,6 +277,95 @@ def test_validate_config_requires_user_identifier(monkeypatch):
     monkeypatch.setattr(module, "INTERNAL_USER_EMAIL", "")
     with pytest.raises(RuntimeError, match="INTERNAL_USER"):
         module.validate_config()
+
+
+def test_validate_config_dry_run_skips_credential_and_queue_checks(monkeypatch):
+    monkeypatch.setattr(module, "DRY_RUN", True)
+    monkeypatch.setattr(module, "CLIENT_ID", "")
+    monkeypatch.setattr(module, "CLIENT_SECRET", "")
+    monkeypatch.setattr(module, "MIRAMAR_FOLDER", ".")
+    monkeypatch.setattr(module, "EMAIL_PROVIDER", "provider")
+    monkeypatch.setattr(module, "EMAIL_FROM_ADDRESS", "from@example.com")
+    monkeypatch.setattr(module, "TARGET_QUEUE_ID", "")
+    monkeypatch.setattr(module, "TARGET_QUEUE_NAME", "")
+    monkeypatch.setattr(module, "INTERNAL_USER_ID", "")
+    monkeypatch.setattr(module, "INTERNAL_USER_EMAIL", "")
+    module.validate_config()  # should not raise
+
+
+def test_validate_config_dry_run_still_requires_email_identity(monkeypatch):
+    monkeypatch.setattr(module, "DRY_RUN", True)
+    monkeypatch.setattr(module, "MIRAMAR_FOLDER", ".")
+    monkeypatch.setattr(module, "EMAIL_PROVIDER", "")
+    monkeypatch.setattr(module, "EMAIL_FROM_ADDRESS", "from@example.com")
+    with pytest.raises(RuntimeError, match="Missing required configuration"):
+        module.validate_config()
+
+
+# =============================================================================
+# Per-file record sampling (load_all_records)
+# =============================================================================
+
+def test_load_all_records_applies_per_file_limit(tmp_path):
+    file_one = tmp_path / "one.csv"
+    file_one.write_text(
+        "Member_ID,Name\n101,Alice\n102,Bob\n103,Carol\n", encoding="utf-8"
+    )
+    file_two = tmp_path / "two.csv"
+    file_two.write_text(
+        "Member_ID,Name\n201,Dan\n202,Erin\n", encoding="utf-8"
+    )
+
+    records = module.load_all_records([str(file_one), str(file_two)], limit_per_file=1)
+
+    assert len(records) == 2
+    assert {r["source_file"] for r in records} == {"one.csv", "two.csv"}
+    by_file = {r["source_file"]: r for r in records}
+    assert by_file["one.csv"]["all_fields"]["Member_ID"] == "101"
+    assert by_file["two.csv"]["all_fields"]["Member_ID"] == "201"
+
+
+def test_load_all_records_no_limit_loads_everything(tmp_path):
+    file_one = tmp_path / "one.csv"
+    file_one.write_text(
+        "Member_ID,Name\n101,Alice\n102,Bob\n103,Carol\n", encoding="utf-8"
+    )
+
+    records = module.load_all_records([str(file_one)], limit_per_file=0)
+
+    assert len(records) == 3
+
+
+# =============================================================================
+# Dry run preview
+# =============================================================================
+
+def test_write_dry_run_preview_builds_payloads_without_api_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(module, "EMAIL_FROM_ADDRESS", "from@example.com")
+    monkeypatch.setattr(module, "EMAIL_PROVIDER", "TestProvider")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("DRY_RUN must not make any API calls")
+
+    monkeypatch.setattr(module, "api_request", fail_if_called)
+    monkeypatch.setattr(module, "authenticate", fail_if_called)
+
+    record = {
+        "record_key": "key-1",
+        "source_file": "sample.csv",
+        "row_number": 2,
+        "all_fields": {"Member_ID": "123"},
+    }
+
+    preview_path = module.write_dry_run_preview([record])
+
+    assert Path(preview_path).exists()
+    with open(preview_path, newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["source_file"] == "sample.csv"
+    assert rows[0]["record_key"] == "key-1"
 
 
 # =============================================================================
