@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.log
+qa_email_insert_results_*.csv
+.pytest_cache/
