@@ -22,11 +22,36 @@ pip install -r requirements.txt
 cp .env.example .env   # fill in CLIENT_ID, CLIENT_SECRET, MIRAMAR_FOLDER, etc.
 ```
 
-### Run
+### Run (single-queue / ad hoc)
 
 ```bash
 python src/qa_noncall_email.py
 ```
+
+### Run (per line-of-business, multi-queue)
+
+Four report groups each run as their own scheduled job, sharing the same
+core ETL but with their own `MIRAMAR_FOLDER`, output directory, and queue
+routing (`configs/*.env`):
+
+| Script | Line of Business | Queue routing |
+|---|---|---|
+| `src/run_medica.py` | MEDICA | single queue (`TARGET_QUEUE_NAME`) |
+| `src/run_optum_egwp.py` | Optum EGWP | single queue (`TARGET_QUEUE_NAME`) |
+| `src/run_hcsc_egwp.py` | HCSC EGWP | 2 report types -> 2 queues (`QUEUE_ROUTES`) |
+| `src/run_hcsc_pdp.py` | HCSC PDP Individual | 6 report types -> 6 queues (`QUEUE_ROUTES`) |
+
+Each `MIRAMAR_FOLDER` should contain **only** that line of business's
+report files -- a file that doesn't match any configured queue route is
+skipped and logged as an error rather than sent anywhere. Run one:
+
+```bash
+python src/run_hcsc_pdp.py
+```
+
+`QUEUE_ROUTES` format: `<filename substring>::<queue name>` pairs
+separated by `;`, matched case-insensitively. See any `configs/*.env` for a
+real example.
 
 ### Tests
 

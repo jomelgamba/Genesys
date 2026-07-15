@@ -64,6 +64,53 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", ".").strip()
 TARGET_QUEUE_NAME = os.getenv("TARGET_QUEUE_NAME", "NonCall Evaluation").strip()
 TARGET_QUEUE_ID = os.getenv("TARGET_QUEUE_ID", "").strip()
 
+# Optional multi-queue routing for scripts that cover more than one report
+# type. Format: "<filename substring>::<queue name>" pairs separated by ";".
+# A file's queue is the first rule whose substring matches (case-insensitive)
+# the source filename. Example:
+#   QUEUE_ROUTES=Approved Enrollment::HCSC_EGWP_NONCALL_Approved_Enrollment;Group Invoice Report::HCSC_EGWP_NONCALL_Group_Invoice
+# When unset, every file uses the single TARGET_QUEUE_NAME/TARGET_QUEUE_ID
+# above (unchanged, backward-compatible single-queue behavior). When set, a
+# file that matches no rule is skipped with a logged error rather than
+# silently falling back to TARGET_QUEUE_NAME -- misrouting a real report
+# into the wrong QA queue is worse than not processing it.
+def _parse_queue_routes(raw: str) -> list[tuple[str, str]]:
+    routes: list[tuple[str, str]] = []
+    for rule in raw.split(";"):
+        rule = rule.strip()
+        if not rule:
+            continue
+        if "::" not in rule:
+            raise RuntimeError(
+                f"Invalid QUEUE_ROUTES rule (expected 'match::queue name'): {rule!r}"
+            )
+        match_text, queue_name = rule.split("::", 1)
+        match_text, queue_name = match_text.strip(), queue_name.strip()
+        if not match_text or not queue_name:
+            raise RuntimeError(
+                f"Invalid QUEUE_ROUTES rule (empty match or queue name): {rule!r}"
+            )
+        routes.append((match_text, queue_name))
+    return routes
+
+
+QUEUE_ROUTES = _parse_queue_routes(os.getenv("QUEUE_ROUTES", ""))
+
+
+def resolve_queue_name_for_file(source_file: str) -> Optional[str]:
+    """
+    Returns the configured queue NAME for a source file, or None if it
+    matches no QUEUE_ROUTES rule (when QUEUE_ROUTES is configured) or if
+    neither QUEUE_ROUTES nor a default TARGET_QUEUE_NAME/ID is configured.
+    """
+    if QUEUE_ROUTES:
+        source_cf = source_file.casefold()
+        for match_text, queue_name in QUEUE_ROUTES:
+            if match_text.casefold() in source_cf:
+                return queue_name
+        return None
+    return TARGET_QUEUE_NAME or None
+
 INTERNAL_USER_EMAIL = os.getenv(
     "INTERNAL_USER_EMAIL", "susernoncall@uspgi.com"
 ).strip()
@@ -382,6 +429,26 @@ def resolve_target_queue() -> tuple[str, str]:
     if not queue_id:
         raise RuntimeError(f"Target queue not found: {TARGET_QUEUE_NAME}")
     return queue_id, queue_name or TARGET_QUEUE_NAME
+
+
+def resolve_queue_id_cached(queue_name: str, cache: dict[str, str]) -> str:
+    """
+    Resolves a queue name to an ID, caching the result so a multi-queue run
+    (QUEUE_ROUTES) only looks up each distinct queue once. The single
+    TARGET_QUEUE_NAME/TARGET_QUEUE_ID pair still goes through
+    resolve_target_queue() so the ID-matches-name safety check keeps working.
+    """
+    if queue_name in cache:
+        return cache[queue_name]
+    if queue_name == TARGET_QUEUE_NAME and TARGET_QUEUE_ID:
+        queue_id, resolved_name = resolve_target_queue()
+    else:
+        queue_id, resolved_name = lookup_queue_by_name(queue_name)
+        if not queue_id:
+            raise RuntimeError(f"Queue not found: {queue_name}")
+    cache[queue_name] = queue_id
+    logging.info("Queue resolved. name=%s id=%s", resolved_name or queue_name, queue_id)
+    return queue_id
 
 
 def user_is_queue_member(queue_id: str, user_id: str) -> bool:
@@ -1135,20 +1202,25 @@ def append_result(
 def write_dry_run_preview(records: list[dict[str, Any]]) -> str:
     """
     Builds email payloads locally (no Genesys API calls) so CSV/header
-    parsing can be validated for a new report format before running live.
+    parsing -- and QUEUE_ROUTES routing -- can be validated before running
+    live. Records whose file matches no queue route are still listed, with
+    target_queue_name="UNROUTED", so a routing config can be checked here
+    before it ever touches the live queue/API.
     """
     preview_rows = []
     for record in records:
+        queue_name = resolve_queue_name_for_file(record["source_file"]) or "UNROUTED"
         payload = build_email_payload(record, queue_id="DRY_RUN", internal_user_id="DRY_RUN")
         logging.info(
-            "[DRY_RUN] file=%s row=%s subject=%s field_count=%s",
-            record["source_file"], record["row_number"], payload["subject"],
+            "[DRY_RUN] file=%s row=%s queue=%s subject=%s field_count=%s",
+            record["source_file"], record["row_number"], queue_name, payload["subject"],
             len(record["all_fields"]),
         )
         preview_rows.append({
             "source_file": record["source_file"],
             "source_row": record["row_number"],
             "record_key": record["record_key"],
+            "target_queue_name": queue_name,
             "subject": payload["subject"],
             "field_count": len(record["all_fields"]),
         })
@@ -1156,13 +1228,17 @@ def write_dry_run_preview(records: list[dict[str, Any]]) -> str:
     with preview_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["source_file", "source_row", "record_key", "subject", "field_count"],
+            fieldnames=[
+                "source_file", "source_row", "record_key",
+                "target_queue_name", "subject", "field_count",
+            ],
         )
         writer.writeheader()
         writer.writerows(preview_rows)
+    unrouted_count = sum(1 for row in preview_rows if row["target_queue_name"] == "UNROUTED")
     logging.info(
-        "DRY_RUN complete. records_previewed=%s preview_file=%s",
-        len(preview_rows), preview_path,
+        "DRY_RUN complete. records_previewed=%s unrouted=%s preview_file=%s",
+        len(preview_rows), unrouted_count, preview_path,
     )
     return str(preview_path)
 
@@ -1194,9 +1270,9 @@ def validate_config() -> None:
         raise RuntimeError(f"Missing required configuration values: {missing}")
     if DRY_RUN:
         return
-    if not TARGET_QUEUE_ID and not TARGET_QUEUE_NAME:
+    if not QUEUE_ROUTES and not TARGET_QUEUE_ID and not TARGET_QUEUE_NAME:
         raise RuntimeError(
-            "Must configure either TARGET_QUEUE_ID or TARGET_QUEUE_NAME."
+            "Must configure either TARGET_QUEUE_ID or TARGET_QUEUE_NAME, or QUEUE_ROUTES."
         )
     if not INTERNAL_USER_ID and not INTERNAL_USER_EMAIL:
         raise RuntimeError(
@@ -1220,6 +1296,10 @@ def main() -> int:
     logging.info("Email provider: %s", EMAIL_PROVIDER)
     logging.info("CSV files found: %s", len(csv_files))
     logging.info("Header markers: %s", HEADER_MARKERS)
+    if QUEUE_ROUTES:
+        logging.info("Queue routes: %s", QUEUE_ROUTES)
+    else:
+        logging.info("Queue routes: none configured (single queue: %s)", TARGET_QUEUE_NAME)
     logging.info("=" * 72)
 
     records = load_all_records(csv_files, PROCESS_LIMIT_PER_FILE)
@@ -1271,17 +1351,60 @@ def main() -> int:
         write_dry_run_preview(records)
         return 0
 
+    results: list[dict[str, Any]] = []
+    success_count = 0
+    failure_count = 0
+
+    # Records whose file matches no QUEUE_ROUTES rule cannot be routed --
+    # fail loud for those rather than guessing a queue. (When QUEUE_ROUTES
+    # is unset every file resolves to the single TARGET_QUEUE_NAME, so this
+    # never triggers in single-queue mode.)
+    unrouted_records = [
+        record for record in records
+        if resolve_queue_name_for_file(record["source_file"]) is None
+    ]
+    if unrouted_records:
+        unrouted_keys = {record["record_key"] for record in unrouted_records}
+        for record in unrouted_records:
+            failure_count += 1
+            append_result(
+                results, record, status="error",
+                error="No QUEUE_ROUTES rule matched this file's name.",
+            )
+        logging.error(
+            "%s record(s) skipped: no queue route matched their source file. files=%s",
+            len(unrouted_records),
+            sorted({record["source_file"] for record in unrouted_records}),
+        )
+        records = [record for record in records if record["record_key"] not in unrouted_keys]
+
+    if not records:
+        result_path = write_results(results)
+        logging.error(
+            "Nothing left to process: every record was unrouted. Result file: %s",
+            result_path,
+        )
+        return 2
+
     authenticate()
 
     internal_user_id, internal_user_name = resolve_target_user()
-    target_queue_id, target_queue_name = resolve_target_queue()
     logging.info("Resolved agent: %s (%s)", internal_user_name, internal_user_id)
-    logging.info("Resolved queue: %s (%s)", target_queue_name, target_queue_id)
 
-    if REQUIRE_QUEUE_MEMBERSHIP and not user_is_queue_member(
-        target_queue_id, internal_user_id
-    ):
-        raise RuntimeError("System User NonCall is not a member of the target queue.")
+    # Resolve (and cache) every distinct queue this run will touch, and
+    # confirm the agent is a member of each one used.
+    queue_id_cache: dict[str, str] = {}
+    record_queue_names = {
+        record["record_key"]: resolve_queue_name_for_file(record["source_file"])
+        for record in records
+    }
+    for queue_name in sorted(set(record_queue_names.values())):
+        queue_id = resolve_queue_id_cached(queue_name, queue_id_cache)
+        if REQUIRE_QUEUE_MEMBERSHIP and not user_is_queue_member(queue_id, internal_user_id):
+            raise RuntimeError(
+                f"System User NonCall is not a member of queue: {queue_name}"
+            )
+
     if not preflight_routing_state(internal_user_id):
         raise RuntimeError("System User NonCall did not pass routing-state preflight.")
     if not check_or_configure_email_utilization(internal_user_id):
@@ -1319,10 +1442,6 @@ def main() -> int:
             raise RuntimeError(f"Evaluator not found: {EVALUATOR_USER_EMAIL}")
         logging.info("Resolved evaluator: %s (%s)", evaluator_user_name, evaluator_user_id)
 
-    results: list[dict[str, Any]] = []
-    success_count = 0
-    failure_count = 0
-
     # Rows succeeded in THIS run, per file (combined with file_already_success
     # to decide whether a whole file is done).
     file_success: dict[str, int] = {}
@@ -1334,6 +1453,7 @@ def main() -> int:
                 position, len(records), record["source_file"], record["row_number"],
             )
             subject = build_email_subject(record)
+            record_queue_id = queue_id_cache[record_queue_names[record["record_key"]]]
             conversation_id = ""
             agent_participant_id = ""
             evaluation_id = ""
@@ -1342,7 +1462,7 @@ def main() -> int:
                 created_conversation_id, create_response, create_status = (
                     create_email_interaction(
                         record=record,
-                        queue_id=target_queue_id,
+                        queue_id=record_queue_id,
                         internal_user_id=internal_user_id,
                     )
                 )
@@ -1357,7 +1477,7 @@ def main() -> int:
                 agent_participant, conversation = wait_for_agent_assignment(
                     conversation_id=conversation_id,
                     internal_user_id=internal_user_id,
-                    queue_id=target_queue_id,
+                    queue_id=record_queue_id,
                 )
                 if not agent_participant:
                     if CLOSE_ON_FAILURE:
@@ -1400,7 +1520,7 @@ def main() -> int:
                     conversation_id=conversation_id,
                     agent_participant_id=agent_participant_id,
                     evaluation_id=evaluation_id,
-                    queue_id=target_queue_id,
+                    queue_id=record_queue_id,
                     agent_user_id=internal_user_id,
                     subject=subject,
                     status="success",
@@ -1427,7 +1547,7 @@ def main() -> int:
                     conversation_id=conversation_id,
                     agent_participant_id=agent_participant_id,
                     evaluation_id=evaluation_id,
-                    queue_id=target_queue_id,
+                    queue_id=record_queue_id,
                     agent_user_id=internal_user_id,
                     subject=subject,
                     status="error",

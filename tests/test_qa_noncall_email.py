@@ -352,6 +352,150 @@ def test_validate_config_dry_run_still_requires_email_identity(monkeypatch):
         module.validate_config()
 
 
+def test_validate_config_queue_routes_satisfies_queue_identification(monkeypatch):
+    monkeypatch.setattr(module, "CLIENT_ID", "id")
+    monkeypatch.setattr(module, "CLIENT_SECRET", "secret")
+    monkeypatch.setattr(module, "MIRAMAR_FOLDER", ".")
+    monkeypatch.setattr(module, "EMAIL_PROVIDER", "provider")
+    monkeypatch.setattr(module, "EMAIL_FROM_ADDRESS", "from@example.com")
+    monkeypatch.setattr(module, "TARGET_QUEUE_ID", "")
+    monkeypatch.setattr(module, "TARGET_QUEUE_NAME", "")
+    monkeypatch.setattr(module, "INTERNAL_USER_ID", "id")
+    monkeypatch.setattr(module, "INTERNAL_USER_EMAIL", "user@example.com")
+    monkeypatch.setattr(module, "QUEUE_ROUTES", [("Approved Enrollment", "SomeQueue")])
+    module.validate_config()  # should not raise
+
+
+# =============================================================================
+# Multi-queue routing (QUEUE_ROUTES)
+# =============================================================================
+
+def test_parse_queue_routes_parses_multiple_rules():
+    routes = module._parse_queue_routes(
+        "Approved Enrollment::HCSC_EGWP_NONCALL_Approved_Enrollment;"
+        "Group Invoice Report::HCSC_EGWP_NONCALL_Group_Invoice"
+    )
+    assert routes == [
+        ("Approved Enrollment", "HCSC_EGWP_NONCALL_Approved_Enrollment"),
+        ("Group Invoice Report", "HCSC_EGWP_NONCALL_Group_Invoice"),
+    ]
+
+
+def test_parse_queue_routes_empty_string_yields_no_rules():
+    assert module._parse_queue_routes("") == []
+    assert module._parse_queue_routes("   ") == []
+
+
+def test_parse_queue_routes_rejects_rule_without_separator():
+    with pytest.raises(RuntimeError, match="Invalid QUEUE_ROUTES rule"):
+        module._parse_queue_routes("Approved Enrollment -> SomeQueue")
+
+
+def test_parse_queue_routes_rejects_empty_match_or_queue():
+    with pytest.raises(RuntimeError, match="Invalid QUEUE_ROUTES rule"):
+        module._parse_queue_routes("::SomeQueue")
+    with pytest.raises(RuntimeError, match="Invalid QUEUE_ROUTES rule"):
+        module._parse_queue_routes("SomeFile::")
+
+
+def test_resolve_queue_name_for_file_matches_case_insensitive_substring(monkeypatch):
+    monkeypatch.setattr(module, "QUEUE_ROUTES", [
+        ("Approved Enrollment", "HCSC_EGWP_NONCALL_Approved_Enrollment"),
+        ("Group Invoice Report", "HCSC_EGWP_NONCALL_Group_Invoice"),
+    ])
+    assert (
+        module.resolve_queue_name_for_file("7282_approved enrollment.csv")
+        == "HCSC_EGWP_NONCALL_Approved_Enrollment"
+    )
+    assert (
+        module.resolve_queue_name_for_file("Group Invoice Report - 202605.csv")
+        == "HCSC_EGWP_NONCALL_Group_Invoice"
+    )
+
+
+def test_resolve_queue_name_for_file_returns_none_when_unmatched(monkeypatch):
+    monkeypatch.setattr(module, "QUEUE_ROUTES", [
+        ("Approved Enrollment", "SomeQueue"),
+    ])
+    assert module.resolve_queue_name_for_file("SLA_Returned_Mail_Report_V6.csv") is None
+
+
+def test_resolve_queue_name_for_file_falls_back_to_target_queue_name_when_no_routes(monkeypatch):
+    monkeypatch.setattr(module, "QUEUE_ROUTES", [])
+    monkeypatch.setattr(module, "TARGET_QUEUE_NAME", "NonCall Evaluation")
+    assert module.resolve_queue_name_for_file("anything.csv") == "NonCall Evaluation"
+
+
+def test_resolve_queue_id_cached_resolves_by_name_and_caches(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_lookup(queue_name):
+        calls["count"] += 1
+        return "queue-id-123", queue_name
+
+    monkeypatch.setattr(module, "TARGET_QUEUE_NAME", "")
+    monkeypatch.setattr(module, "TARGET_QUEUE_ID", "")
+    monkeypatch.setattr(module, "lookup_queue_by_name", fake_lookup)
+
+    cache: dict = {}
+    first = module.resolve_queue_id_cached("HCSC_PDP_NONCALL_Returned_Mail", cache)
+    second = module.resolve_queue_id_cached("HCSC_PDP_NONCALL_Returned_Mail", cache)
+
+    assert first == second == "queue-id-123"
+    assert calls["count"] == 1  # second call served from cache
+
+
+def test_resolve_queue_id_cached_raises_when_queue_not_found(monkeypatch):
+    monkeypatch.setattr(module, "TARGET_QUEUE_NAME", "")
+    monkeypatch.setattr(module, "TARGET_QUEUE_ID", "")
+    monkeypatch.setattr(module, "lookup_queue_by_name", lambda name: (None, None))
+
+    with pytest.raises(RuntimeError, match="Queue not found"):
+        module.resolve_queue_id_cached("NoSuchQueue", {})
+
+
+def test_resolve_queue_id_cached_uses_resolve_target_queue_for_default_queue(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_resolve_target_queue():
+        calls["count"] += 1
+        return "default-queue-id", "NonCall Evaluation"
+
+    monkeypatch.setattr(module, "TARGET_QUEUE_NAME", "NonCall Evaluation")
+    monkeypatch.setattr(module, "TARGET_QUEUE_ID", "some-id")
+    monkeypatch.setattr(module, "resolve_target_queue", fake_resolve_target_queue)
+
+    queue_id = module.resolve_queue_id_cached("NonCall Evaluation", {})
+
+    assert queue_id == "default-queue-id"
+    assert calls["count"] == 1
+
+
+def test_write_dry_run_preview_shows_unrouted_for_unmatched_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(module, "EMAIL_FROM_ADDRESS", "from@example.com")
+    monkeypatch.setattr(module, "EMAIL_PROVIDER", "TestProvider")
+    monkeypatch.setattr(module, "QUEUE_ROUTES", [
+        ("routed_file", "SomeQueue"),
+    ])
+
+    routed = {
+        "record_key": "key-1", "source_file": "routed_file.csv",
+        "row_number": 2, "all_fields": {"Member_ID": "1"},
+    }
+    unrouted = {
+        "record_key": "key-2", "source_file": "unknown_file.csv",
+        "row_number": 2, "all_fields": {"Member_ID": "2"},
+    }
+
+    preview_path = module.write_dry_run_preview([routed, unrouted])
+
+    with open(preview_path, newline="", encoding="utf-8-sig") as handle:
+        rows = {row["record_key"]: row for row in csv.DictReader(handle)}
+    assert rows["key-1"]["target_queue_name"] == "SomeQueue"
+    assert rows["key-2"]["target_queue_name"] == "UNROUTED"
+
+
 # =============================================================================
 # Per-file record sampling (load_all_records)
 # =============================================================================
