@@ -10,17 +10,29 @@ CLIENT_ID/CLIENT_SECRET/GENESYS_REGION (same credentials the matching
 run_*.py launcher uses) -- this works regardless of working directory, so
 it's the reliable way to run this from PyCharm or anywhere else.
 
+--queue/--days/--close can all be passed on the command line OR set as
+environment variables (in that same --config file, or directly in a
+PyCharm run configuration's Environment variables field), so this can be
+run with zero typed parameters:
+    CLEANUP_QUEUE_NAME=HCSC PDP NONCALL Approved Enrollment
+    CLEANUP_DAYS=7
+    CLEANUP_CLOSE=false
+A CLI flag always overrides the matching environment variable.
+
 SAFE BY DEFAULT: lists what it finds and does nothing else. Nothing is
-closed unless you pass --close AND type "yes" at the confirmation prompt.
+closed unless --close (flag or CLEANUP_CLOSE=true) is set AND you type
+"yes" at the confirmation prompt.
 
 Usage:
     python cleanup_open_conversations.py --config ../configs/hcsc_pdp.env --queue "HCSC PDP NONCALL Approved Enrollment"
     python cleanup_open_conversations.py --config ../configs/hcsc_pdp.env --queue "HCSC PDP NONCALL Approved Enrollment" --days 3
     python cleanup_open_conversations.py --config ../configs/hcsc_pdp.env --queue "HCSC PDP NONCALL Approved Enrollment" --close
+    python cleanup_open_conversations.py --config ../configs/hcsc_pdp.env   # queue/days/close all from CLEANUP_* env vars
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -115,9 +127,18 @@ def summarize(conversation: dict[str, Any]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--queue", required=True, help="Genesys queue name to search")
-    parser.add_argument("--days", type=int, default=7, help="How many days back to search (default 7)")
-    parser.add_argument("--close", action="store_true", help="Actually close what's found (asks for confirmation)")
+    parser.add_argument(
+        "--queue", default=None,
+        help="Genesys queue name to search (or set CLEANUP_QUEUE_NAME)",
+    )
+    parser.add_argument(
+        "--days", type=int, default=None,
+        help="How many days back to search (or set CLEANUP_DAYS, default 7)",
+    )
+    parser.add_argument(
+        "--close", action="store_true",
+        help="Actually close what's found, asks for confirmation (or set CLEANUP_CLOSE=true)",
+    )
     parser.add_argument(
         "--config",
         help="Path to a configs/*.env file to load CLIENT_ID/CLIENT_SECRET/etc from "
@@ -126,25 +147,31 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    queue_name = args.queue or os.getenv("CLEANUP_QUEUE_NAME", "").strip()
+    if not queue_name:
+        parser.error("--queue is required (or set CLEANUP_QUEUE_NAME in the environment/config)")
+    days = args.days if args.days is not None else int(os.getenv("CLEANUP_DAYS", "7"))
+    close = args.close or os.getenv("CLEANUP_CLOSE", "false").strip().lower() in {"1", "true", "yes", "y"}
+
     etl.authenticate()
 
-    queue_id, resolved_name = etl.lookup_queue_by_name(args.queue)
+    queue_id, resolved_name = etl.lookup_queue_by_name(queue_name)
     if not queue_id:
-        print(f"Queue not found: {args.queue}", file=sys.stderr)
+        print(f"Queue not found: {queue_name}", file=sys.stderr)
         return 1
     print(f"Queue: {resolved_name} ({queue_id})")
 
-    open_conversations = find_open_conversations(queue_id, args.days)
+    open_conversations = find_open_conversations(queue_id, days)
     if not open_conversations:
-        print(f"No open conversations found in the last {args.days} day(s).")
+        print(f"No open conversations found in the last {days} day(s).")
         return 0
 
     print(f"\nFound {len(open_conversations)} open conversation(s):")
     for conversation in open_conversations:
         print(summarize(conversation))
 
-    if not args.close:
-        print("\nList-only (pass --close to close these). Nothing was changed.")
+    if not close:
+        print("\nList-only (pass --close or set CLEANUP_CLOSE=true to close these). Nothing was changed.")
         return 0
 
     print(f"\nAbout to close {len(open_conversations)} conversation(s) in queue '{resolved_name}'.")
