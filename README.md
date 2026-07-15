@@ -49,6 +49,13 @@ skipped and logged as an error rather than sent anywhere. Run one:
 python src/run_hcsc_pdp.py
 ```
 
+**Deployment layout:** `configs/` must sit as a direct sibling of the
+`run_*.py` scripts (same folder) -- e.g. drop `qa_noncall_email.py`,
+all four `run_*.py` files, and `configs/` together into one folder and
+run from there. If `configs/<name>.env` isn't found next to the script,
+the launcher exits immediately with a clear error naming the path it
+expected, rather than silently falling back to some other `.env`.
+
 `QUEUE_ROUTES` format: `<filename substring>::<queue name>` pairs
 separated by `;`, matched case-insensitively. See any `configs/*.env` for a
 real example.

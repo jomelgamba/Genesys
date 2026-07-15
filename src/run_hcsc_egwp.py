@@ -11,12 +11,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "hcsc_egwp.env"
+CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "hcsc_egwp.env"
 if not CONFIG_PATH.is_file():
     raise SystemExit(
         f"Config file not found: {CONFIG_PATH}\n"
-        "configs/ must be a sibling of the folder this script lives in "
-        "(e.g. Genesys_API/configs/, not Genesys_API/API/configs/)."
+        "configs/ must be a sibling of this script (same folder as the "
+        "run_*.py files)."
     )
 load_dotenv(CONFIG_PATH, override=True)
 
