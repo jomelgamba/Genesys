@@ -97,6 +97,16 @@ def _parse_queue_routes(raw: str) -> list[tuple[str, str]]:
 QUEUE_ROUTES = _parse_queue_routes(os.getenv("QUEUE_ROUTES", ""))
 
 
+def _normalize_filename_for_matching(text: str) -> str:
+    """
+    Strips everything but letters/digits before comparing, so QUEUE_ROUTES
+    rules match regardless of how a given export happens to space/underscore
+    its filename that week (e.g. "Category 2_Enrollment Maintenance Process"
+    vs "Category2_EnrollmentMaintenanceProcess.csv").
+    """
+    return "".join(ch for ch in text if ch.isalnum()).casefold()
+
+
 def resolve_queue_name_for_file(source_file: str) -> Optional[str]:
     """
     Returns the configured queue NAME for a source file, or None if it
@@ -104,9 +114,9 @@ def resolve_queue_name_for_file(source_file: str) -> Optional[str]:
     neither QUEUE_ROUTES nor a default TARGET_QUEUE_NAME/ID is configured.
     """
     if QUEUE_ROUTES:
-        source_cf = source_file.casefold()
+        source_norm = _normalize_filename_for_matching(source_file)
         for match_text, queue_name in QUEUE_ROUTES:
-            if match_text.casefold() in source_cf:
+            if _normalize_filename_for_matching(match_text) in source_norm:
                 return queue_name
         return None
     return TARGET_QUEUE_NAME or None

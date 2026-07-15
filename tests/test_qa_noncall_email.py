@@ -420,6 +420,24 @@ def test_resolve_queue_name_for_file_returns_none_when_unmatched(monkeypatch):
     assert module.resolve_queue_name_for_file("SLA_Returned_Mail_Report_V6.csv") is None
 
 
+def test_resolve_queue_name_for_file_ignores_spacing_and_underscore_differences(monkeypatch):
+    # Regression: production filenames don't always match the spacing of the
+    # configured rule (e.g. "Category 2_Enrollment Maintenance Process" vs
+    # "Category2_EnrollmentMaintenanceProcess.csv" -- no spaces at all).
+    monkeypatch.setattr(module, "QUEUE_ROUTES", [
+        ("Category 2_Enrollment Maintenance Process", "HCSC_PDP_Enrollment_Maintenance"),
+        ("Category 6 Fulfillment Process", "HCSC_PDP_Fulfillment_Process"),
+    ])
+    assert (
+        module.resolve_queue_name_for_file("Category2_EnrollmentMaintenanceProcess.csv")
+        == "HCSC_PDP_Enrollment_Maintenance"
+    )
+    assert (
+        module.resolve_queue_name_for_file("Category6_Fulfillment_Process.csv")
+        == "HCSC_PDP_Fulfillment_Process"
+    )
+
+
 def test_resolve_queue_name_for_file_falls_back_to_target_queue_name_when_no_routes(monkeypatch):
     monkeypatch.setattr(module, "QUEUE_ROUTES", [])
     monkeypatch.setattr(module, "TARGET_QUEUE_NAME", "NonCall Evaluation")
