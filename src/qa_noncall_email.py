@@ -1100,6 +1100,41 @@ def close_email_conversation(
     return overall_success
 
 
+def close_conversation_after_interrupt(
+    conversation_id: str, agent_participant_id: str
+) -> None:
+    """
+    A hard interrupt (Ctrl+C / KeyboardInterrupt) is not caught by the
+    per-record `except Exception` handler, so a conversation created just
+    before the interrupt would otherwise be left open -- occupying the
+    agent's (usually EMAIL_MAXIMUM_CAPACITY=1) email capacity and silently
+    blocking every interaction the *next* run tries to create until it's
+    closed. Best-effort clean it up here instead.
+    """
+    if not conversation_id:
+        return
+    if not CLOSE_ON_FAILURE:
+        logging.warning(
+            "CLOSE_ON_FAILURE is false -- conversation_id=%s was left open and "
+            "may be occupying the agent's email capacity until closed manually.",
+            conversation_id,
+        )
+        return
+    try:
+        close_email_conversation(conversation_id, agent_participant_id or None, None, None)
+        logging.warning(
+            "Closed in-flight conversation after interrupt. conversation_id=%s",
+            conversation_id,
+        )
+    except Exception:
+        logging.exception(
+            "Could not close in-flight conversation after interrupt -- check "
+            "Genesys Cloud manually, it may still be occupying the agent's "
+            "email capacity. conversation_id=%s",
+            conversation_id,
+        )
+
+
 # =============================================================================
 # OPTIONAL QUALITY EVALUATION
 # =============================================================================
@@ -1456,6 +1491,11 @@ def main() -> int:
     # to decide whether a whole file is done).
     file_success: dict[str, int] = {}
 
+    # Defaults so a KeyboardInterrupt before the first iteration doesn't
+    # NameError inside the except block below.
+    conversation_id = ""
+    agent_participant_id = ""
+
     try:
         for position, record in enumerate(records, start=1):
             logging.info(
@@ -1569,6 +1609,7 @@ def main() -> int:
 
     except KeyboardInterrupt:
         logging.warning("Run interrupted by user. Writing partial results.")
+        close_conversation_after_interrupt(conversation_id, agent_participant_id)
 
     # Move files where EVERY row is accounted for as successful (rows succeeded
     # this run + rows already successful in prior runs == total rows in file).

@@ -267,6 +267,58 @@ def test_close_email_conversation_returns_false_when_conversation_unreadable(mon
 
 
 # =============================================================================
+# Cleanup after a hard interrupt (KeyboardInterrupt)
+# =============================================================================
+
+def test_close_conversation_after_interrupt_closes_in_flight_conversation(monkeypatch):
+    monkeypatch.setattr(module, "CLOSE_ON_FAILURE", True)
+    calls = []
+
+    def fake_close(conversation_id, agent_participant_id, wrapup_code_id, wrapup_code_name):
+        calls.append((conversation_id, agent_participant_id))
+        return True
+
+    monkeypatch.setattr(module, "close_email_conversation", fake_close)
+
+    module.close_conversation_after_interrupt("conv-123", "agent-456")
+
+    assert calls == [("conv-123", "agent-456")]
+
+
+def test_close_conversation_after_interrupt_noop_when_no_conversation(monkeypatch):
+    monkeypatch.setattr(module, "CLOSE_ON_FAILURE", True)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("should not attempt to close when conversation_id is empty")
+
+    monkeypatch.setattr(module, "close_email_conversation", fail_if_called)
+
+    module.close_conversation_after_interrupt("", "")  # should not raise
+
+
+def test_close_conversation_after_interrupt_respects_close_on_failure_false(monkeypatch):
+    monkeypatch.setattr(module, "CLOSE_ON_FAILURE", False)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("should not close when CLOSE_ON_FAILURE is false")
+
+    monkeypatch.setattr(module, "close_email_conversation", fail_if_called)
+
+    module.close_conversation_after_interrupt("conv-123", "agent-456")  # should not raise
+
+
+def test_close_conversation_after_interrupt_swallows_close_failure(monkeypatch):
+    monkeypatch.setattr(module, "CLOSE_ON_FAILURE", True)
+
+    def raising_close(*args, **kwargs):
+        raise RuntimeError("Genesys API down")
+
+    monkeypatch.setattr(module, "close_email_conversation", raising_close)
+
+    module.close_conversation_after_interrupt("conv-123", "agent-456")  # should not raise
+
+
+# =============================================================================
 # Idempotency ledger
 # =============================================================================
 
