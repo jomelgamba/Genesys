@@ -11,7 +11,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent.parent / "configs" / "hcsc_egwp.env", override=True)
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "hcsc_egwp.env"
+if not CONFIG_PATH.is_file():
+    raise SystemExit(
+        f"Config file not found: {CONFIG_PATH}\n"
+        "configs/ must be a sibling of the folder this script lives in "
+        "(e.g. Genesys_API/configs/, not Genesys_API/API/configs/)."
+    )
+load_dotenv(CONFIG_PATH, override=True)
 
 import qa_noncall_email as etl  # noqa: E402
 
